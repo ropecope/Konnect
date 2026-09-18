@@ -7861,6 +7861,173 @@ mod tests {
         }
     }
 
+    async fn call_library_tool(name: &str, args: serde_json::Value) -> CallToolResult {
+        let tool = tools()
+            .into_iter()
+            .find(|tool| tool.name == name)
+            .unwrap_or_else(|| panic!("library must expose {name}"));
+        (tool.handler)(&args, Arc::new(test_ctx()))
+            .await
+            .unwrap_or_else(|e| panic!("{name} must not bubble an anyhow error: {e}"))
+    }
+
+    #[tokio::test]
+    async fn copy_symbol_to_library_creates_missing_destination_and_preserves_symbol_data() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source.kicad_sym");
+        let destination = tmp.path().join("new-destination.kicad_sym");
+        let source_content = concat!(
+            "(kicad_symbol_lib\n",
+            "  (version 20231120)\n",
+            "  (generator kicad_symbol_editor)\n",
+            "  (symbol \"TEST_PART\"\n",
+            "    (property \"Reference\" \"U\" (at 0 5.08 0))\n",
+            "    (property \"Value\" \"TEST_PART\" (at 0 -5.08 0))\n",
+            "    (symbol \"TEST_PART_1_1\"\n",
+            "      (pin input line (at -5.08 2.54 0) (length 2.54) (name \"IN\") (number \"1\"))\n",
+            "      (pin passive line (at 5.08 -2.54 180) (length 2.54) (name \"OUT\") (number \"2\"))\n",
+            "    )\n",
+            "  )\n",
+            ")\n",
+        );
+        std::fs::write(&source, source_content).unwrap();
+        let source_before = std::fs::read(&source).unwrap();
+        assert!(!destination.exists());
+
+        let args = json!({
+            "source_library": source.to_string_lossy(),
+            "symbol_name": "TEST_PART",
+            "destination_library": destination.to_string_lossy(),
+        });
+        let result = call_library_tool("copy_symbol_to_library", args).await;
+        assert!(!result.is_error, "copy failed: {:?}", result.content);
+        assert!(destination.exists());
+
+        let destination_content = std::fs::read_to_string(&destination).unwrap();
+        assert!(destination_content.contains("(version 20231120)"));
+        assert!(destination_content.contains("(generator kicad_symbol_editor)"));
+        let destination_root = parse_sexp(&destination_content).unwrap();
+        assert_eq!(destination_root.head(), Some("kicad_symbol_lib"));
+        let (source_start, source_end) =
+            direct_library_block(source_content, "kicad_symbol_lib", "symbol", "TEST_PART")
+                .unwrap();
+        let source_symbol = parse_sexp(&source_content[source_start..source_end]).unwrap();
+        let (destination_start, destination_end) = direct_library_block(
+            &destination_content,
+            "kicad_symbol_lib",
+            "symbol",
+            "TEST_PART",
+        )
+        .unwrap();
+        let destination_symbol =
+            parse_sexp(&destination_content[destination_start..destination_end]).unwrap();
+        let pin_data = |symbol: &SexpNode| {
+            let mut pins: Vec<_> = symbol
+                .find_all("symbol")
+                .into_iter()
+                .flat_map(|unit| unit.find_all("pin"))
+                .map(|pin| {
+                    (
+                        pin.get(1)
+                            .and_then(|n| n.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        pin.find("name")
+                            .and_then(|n| n.get(1))
+                            .and_then(|n| n.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        pin.find("number")
+                            .and_then(|n| n.get(1))
+                            .and_then(|n| n.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                    )
+                })
+                .collect();
+            pins.sort();
+            pins
+        };
+        assert_eq!(pin_data(&source_symbol), pin_data(&destination_symbol));
+        assert_eq!(pin_data(&destination_symbol).len(), 2);
+        assert_eq!(std::fs::read(&source).unwrap(), source_before);
+    }
+
+    #[tokio::test]
+    async fn copy_symbol_to_library_refuses_existing_symbol_without_overwrite() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source.kicad_sym");
+        let destination = tmp.path().join("destination.kicad_sym");
+        let source_content = "(kicad_symbol_lib (version 20231120) (generator kicad_symbol_editor) (symbol \"X\" (symbol \"X_1_1\" (pin input line (at 0 0) (length 2.54) (name \"A\") (number \"1\")))))\n";
+        let destination_content = "(kicad_symbol_lib (version 20231120) (generator kicad_symbol_editor) (symbol \"X\" (symbol \"X_1_1\" (pin output line (at 0 0) (length 2.54) (name \"OLD\") (number \"9\")))))\n";
+        std::fs::write(&source, source_content).unwrap();
+        std::fs::write(&destination, destination_content).unwrap();
+        let before = std::fs::read(&destination).unwrap();
+        let tool = tools()
+            .into_iter()
+            .find(|tool| tool.name == "copy_symbol_to_library")
+            .unwrap();
+        let error = (tool.handler)(
+            &json!({
+                "source_library": source.to_string_lossy(),
+                "symbol_name": "X",
+                "destination_library": destination.to_string_lossy(),
+            }),
+            Arc::new(test_ctx()),
+        )
+        .await
+        .expect_err("existing symbol must be refused");
+        assert!(error
+            .to_string()
+            .contains("destination symbol already exists"));
+        assert_eq!(std::fs::read(&destination).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn copy_footprint_to_library_copies_structure_and_refuses_without_overwrite() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source.kicad_mod");
+        let destination_dir = tmp.path().join("dest.pretty");
+        let destination = destination_dir.join("FP.kicad_mod");
+        let source_content = "(footprint \"FP\" (version 20240108) (generator pcbnew) (layer \"F.Cu\") (fp_rect (start -1 -1) (end 1 1) (stroke (width 0.1) (type default)) (fill none) (layer \"F.SilkS\")) (pad \"1\" smd roundrect (at -0.5 0) (size 0.8 1) (layers \"F.Cu\" \"F.Paste\" \"F.Mask\") (roundrect_rratio 0.25)) (pad \"2\" smd roundrect (at 0.5 0) (size 0.8 1) (layers \"F.Cu\" \"F.Paste\" \"F.Mask\") (roundrect_rratio 0.25)))\n";
+        std::fs::write(&source, source_content).unwrap();
+        let source_before = std::fs::read(&source).unwrap();
+        let result = call_library_tool(
+            "copy_footprint_to_library",
+            json!({
+                "source": source.to_string_lossy(),
+                "destination_library": destination_dir.to_string_lossy(),
+            }),
+        )
+        .await;
+        assert!(!result.is_error, "copy failed: {:?}", result.content);
+        assert_eq!(std::fs::read(&source).unwrap(), source_before);
+        let copied = std::fs::read_to_string(&destination).unwrap();
+        let parsed = parse_sexp(&copied).unwrap();
+        assert_eq!(parsed.head(), Some("footprint"));
+        assert_eq!(parsed.find_all("pad").len(), 2);
+        assert!(copied.contains("fp_rect"));
+
+        let before = std::fs::read(&destination).unwrap();
+        let tool = tools()
+            .into_iter()
+            .find(|tool| tool.name == "copy_footprint_to_library")
+            .unwrap();
+        let error = (tool.handler)(
+            &json!({
+                "source": source.to_string_lossy(),
+                "destination_library": destination_dir.to_string_lossy(),
+            }),
+            Arc::new(test_ctx()),
+        )
+        .await
+        .expect_err("existing footprint must be refused");
+        assert!(error
+            .to_string()
+            .contains("destination footprint already exists"));
+        assert_eq!(std::fs::read(&destination).unwrap(), before);
+    }
+
     /// Build a temp "project dir" containing a `sym-lib-table` that references a
     /// single `.kicad_sym` library, returning the project dir path. The URI is
     /// absolute (not `${KICAD_*}`) so it resolves without KiCad env vars.
