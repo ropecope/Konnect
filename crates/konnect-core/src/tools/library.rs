@@ -175,6 +175,21 @@ pub fn tools() -> Vec<ToolDef> {
             |args, ctx| async move { handle_edit_footprint_pad(args, ctx).await }
         ),
         tool!(
+            "copy_footprint_to_library",
+            "Copy an existing KiCad footprint verbatim into a .pretty library without reconstructing it.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "source": { "type": "string", "description": "Existing .kicad_mod source" },
+                    "destination_library": { "type": "string", "description": "Destination .pretty directory" },
+                    "new_name": { "type": "string", "description": "Optional destination footprint name" },
+                    "overwrite": { "type": "boolean", "default": false }
+                },
+                "required": ["source", "destination_library"]
+            }),
+            |args, ctx| async move { handle_copy_footprint_to_library(args, ctx).await }
+        ),
+        tool!(
             "register_footprint_library",
             "Register a local footprint library directory in the KiCAD global or project library table.",
             json!({
@@ -288,6 +303,22 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["library_path", "symbol_name"]
             }),
             |args, ctx| async move { handle_delete_symbol(args, ctx).await }
+        ),
+        tool!(
+            "copy_symbol_to_library",
+            "Copy one existing KiCad symbol definition verbatim into another .kicad_sym library without reconstructing it.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "source_library": { "type": "string", "description": "Source .kicad_sym library" },
+                    "symbol_name": { "type": "string", "description": "Exact top-level symbol name" },
+                    "destination_library": { "type": "string", "description": "Destination .kicad_sym library" },
+                    "new_name": { "type": "string", "description": "Optional destination symbol name" },
+                    "overwrite": { "type": "boolean", "default": false }
+                },
+                "required": ["source_library", "symbol_name", "destination_library"]
+            }),
+            |args, ctx| async move { handle_copy_symbol_to_library(args, ctx).await }
         ),
         tool!(
             "list_symbols_in_library",
@@ -438,6 +469,167 @@ pub fn tools() -> Vec<ToolDef> {
 }
 
 // ─── Handlers ─────────────────────────────────────────────────────────────────
+
+fn renamed_library_block(block: &str, tag: &str, new_name: Option<&str>) -> anyhow::Result<String> {
+    let Some(new_name) = new_name else {
+        return Ok(block.to_string());
+    };
+    if new_name.is_empty() || new_name.contains('"') || new_name.contains('\n') {
+        anyhow::bail!("new_name must be a non-empty KiCad name without quotes or newlines");
+    }
+    let prefix = format!("({tag} \"");
+    let start = block
+        .find(&prefix)
+        .ok_or_else(|| anyhow::anyhow!("valid {tag} root not found"))?
+        + prefix.len();
+    let end = block[start..]
+        .find('"')
+        .map(|i| start + i)
+        .ok_or_else(|| anyhow::anyhow!("{tag} name is not quoted"))?;
+    let mut out = block.to_string();
+    out.replace_range(start..end, new_name);
+    Ok(out)
+}
+
+fn direct_library_block(
+    content: &str,
+    root_tag: &str,
+    item_tag: &str,
+    name: &str,
+) -> anyhow::Result<(usize, usize)> {
+    let root =
+        parse_sexp(content).map_err(|e| anyhow::anyhow!("invalid KiCad S-expression: {e}"))?;
+    if root.head() != Some(root_tag) {
+        anyhow::bail!("source root must be {root_tag}");
+    }
+    for (start, end) in find_direct_child_blocks(content, root_tag) {
+        let node = parse_sexp(&content[start..end])
+            .map_err(|e| anyhow::anyhow!("invalid library item: {e}"))?;
+        if node.head() == Some(item_tag) && node.get(1).and_then(|n| n.as_str()) == Some(name) {
+            return Ok((start, end));
+        }
+    }
+    anyhow::bail!("{item_tag} '{name}' not found")
+}
+
+async fn handle_copy_footprint_to_library(
+    args: &serde_json::Value,
+    _ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let source = get_path(args, "source")?;
+    let destination_library = get_path(args, "destination_library")?;
+    let overwrite = args["overwrite"].as_bool().unwrap_or(false);
+    let source_content = read_consistent(&source)?;
+    let source_node =
+        parse_sexp(&source_content).map_err(|e| anyhow::anyhow!("invalid footprint: {e}"))?;
+    let name = source_node
+        .get(1)
+        .and_then(|n| n.as_str())
+        .ok_or_else(|| anyhow::anyhow!("source root must be a named footprint"))?;
+    if source_node.head() != Some("footprint") {
+        anyhow::bail!("source root must be a KiCad footprint");
+    }
+    let destination_name = args["new_name"].as_str().unwrap_or(name);
+    let block = renamed_library_block(
+        source_content.trim(),
+        "footprint",
+        args["new_name"].as_str(),
+    )?;
+    std::fs::create_dir_all(&destination_library)?;
+    let output = destination_library.join(format!("{destination_name}.kicad_mod"));
+    let existed = output.exists();
+    if existed && !overwrite {
+        anyhow::bail!("destination footprint already exists: {}", output.display());
+    }
+    if existed {
+        let expected = read_consistent(&output)?;
+        write_atomic_if_unchanged(&output, &expected, &block)?;
+    } else {
+        write_new_atomic(&output, &block)?;
+    }
+    let written = read_consistent(&output)?;
+    let node = parse_sexp(&written)
+        .map_err(|e| anyhow::anyhow!("destination read-back is invalid: {e}"))?;
+    if node.head() != Some("footprint")
+        || node.get(1).and_then(|n| n.as_str()) != Some(destination_name)
+    {
+        anyhow::bail!("destination read-back does not match requested footprint");
+    }
+    Ok(CallToolResult::text(serde_json::to_string(&json!({"success":true,"source":source,"destination":output,"name":destination_name,"overwritten":existed})).unwrap()))
+}
+
+async fn handle_copy_symbol_to_library(
+    args: &serde_json::Value,
+    _ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let source = get_path(args, "source_library")?;
+    let destination = get_path(args, "destination_library")?;
+    let symbol_name = match require_str(args, "symbol_name") {
+        Ok(v) => v,
+        Err(_) => anyhow::bail!("symbol_name is missing or not a string"),
+    };
+    let overwrite = args["overwrite"].as_bool().unwrap_or(false);
+    let source_content = read_consistent(&source)?;
+    let (start, end) =
+        direct_library_block(&source_content, "kicad_symbol_lib", "symbol", symbol_name)?;
+    let source_block = &source_content[start..end];
+    if source_block.contains("(extends ") {
+        anyhow::bail!(
+            "symbol '{symbol_name}' has an extends dependency; dependency-complete copy is refused"
+        );
+    }
+    let destination_name = args["new_name"].as_str().unwrap_or(symbol_name);
+    let block = renamed_library_block(source_block, "symbol", args["new_name"].as_str())?;
+    let destination_content = if destination.exists() {
+        read_consistent(&destination)?
+    } else {
+        "(kicad_symbol_lib (version 20231120) (generator kicad_symbol_editor))\n".to_string()
+    };
+    let root = parse_sexp(&destination_content)
+        .map_err(|e| anyhow::anyhow!("invalid destination symbol library: {e}"))?;
+    if root.head() != Some("kicad_symbol_lib") {
+        anyhow::bail!("destination root must be kicad_symbol_lib");
+    }
+    let existing = root
+        .find_all("symbol")
+        .iter()
+        .any(|n| n.get(1).and_then(|v| v.as_str()) == Some(destination_name));
+    if existing && !overwrite {
+        anyhow::bail!("destination symbol already exists: {destination_name}");
+    }
+    let root_start = find_block_starts(&destination_content, "kicad_symbol_lib")
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("destination root not found"))?;
+    let (_, root_end) = find_balanced_block(&destination_content, root_start)
+        .ok_or_else(|| anyhow::anyhow!("destination root is unbalanced"))?;
+    let insertion = format!("\n  {block}\n");
+    let mut new_content = apply_edits(
+        destination_content.clone(),
+        vec![SexpEdit::insert(root_end - 1, insertion)],
+    );
+    if existing {
+        let (old_start, old_end) = direct_library_block(
+            &destination_content,
+            "kicad_symbol_lib",
+            "symbol",
+            destination_name,
+        )?;
+        new_content = apply_edits(
+            destination_content.clone(),
+            vec![SexpEdit::replace(old_start, old_end, block)],
+        );
+    }
+    if destination.exists() {
+        let expected = read_consistent(&destination)?;
+        write_atomic_if_unchanged(&destination, &expected, &new_content)?;
+    } else {
+        write_new_atomic(&destination, &new_content)?;
+    }
+    let written = read_consistent(&destination)?;
+    direct_library_block(&written, "kicad_symbol_lib", "symbol", destination_name)?;
+    Ok(CallToolResult::text(serde_json::to_string(&json!({"success":true,"source":source,"destination":destination,"name":destination_name,"overwritten":existing})).unwrap()))
+}
 
 // ─── Footprint / symbol geometry (pure, unit-tested) ──────────────────────────
 
