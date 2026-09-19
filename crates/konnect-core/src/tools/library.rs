@@ -6,7 +6,7 @@
 use crate::mcp::error::ToolErrorKind;
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
-use crate::tools::{get_path, require_array, require_str, ToolContext, ToolDef};
+use crate::tools::{get_path, invalid_arg, require_array, require_str, ToolContext, ToolDef};
 use konnect_schematic_editor::types::fmt_f64;
 use konnect_sexp::parser::{parse_sexp, SexpNode};
 use konnect_sexp::writer::{
@@ -290,6 +290,25 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["library_path", "name", "reference_prefix"]
             }),
             |args, ctx| async move { handle_create_symbol(args, ctx).await }
+        ),
+        tool!(
+            "set_library_symbol_properties",
+            "Update one or more existing or new top-level property values on one exact KiCAD symbol without reconstructing its pins, units, graphics, UUIDs, or other properties. The operation is atomic and performs an immediate read-back.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "library_path": { "type": "string", "description": "Path to the .kicad_sym library file" },
+                    "symbol_name": { "type": "string", "description": "Exact top-level symbol name" },
+                    "properties": {
+                        "type": "object",
+                        "description": "Property name to string value map. Existing properties are updated; missing properties are added as top-level properties. Reference is not supported.",
+                        "additionalProperties": { "type": "string" },
+                        "minProperties": 1
+                    }
+                },
+                "required": ["library_path", "symbol_name", "properties"]
+            }),
+            |args, ctx| async move { handle_set_library_symbol_properties(args, ctx).await }
         ),
         tool!(
             "delete_symbol",
@@ -629,6 +648,264 @@ async fn handle_copy_symbol_to_library(
     let written = read_consistent(&destination)?;
     direct_library_block(&written, "kicad_symbol_lib", "symbol", destination_name)?;
     Ok(CallToolResult::text(serde_json::to_string(&json!({"success":true,"source":source,"destination":destination,"name":destination_name,"overwritten":existing})).unwrap()))
+}
+
+/// Locate direct top-level properties on one exact symbol. The returned byte
+/// spans point at the value *inside* its quotes, so replacing one value keeps
+/// every other byte of the symbol (including its units, graphics and UUIDs)
+/// unchanged.
+#[derive(Debug, Clone)]
+struct LibrarySymbolPropertyLocation {
+    name: String,
+    value: String,
+    value_start: usize,
+    value_end: usize,
+}
+
+fn quoted_string_spans(block: &str) -> Vec<(usize, usize)> {
+    let bytes = block.as_bytes();
+    let mut spans = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'"' {
+            i += 1;
+            continue;
+        }
+        let start = i + 1;
+        i = start;
+        let mut escaped = false;
+        while i < bytes.len() {
+            if escaped {
+                escaped = false;
+            } else if bytes[i] == b'\\' {
+                escaped = true;
+            } else if bytes[i] == b'"' {
+                spans.push((start, i));
+                i += 1;
+                break;
+            }
+            i += 1;
+        }
+    }
+    spans
+}
+
+fn direct_symbol_properties(
+    symbol_block: &str,
+) -> anyhow::Result<Vec<LibrarySymbolPropertyLocation>> {
+    let mut properties = Vec::new();
+    for (start, end) in find_direct_child_blocks(symbol_block, "symbol") {
+        let property_block = &symbol_block[start..end];
+        let node = parse_sexp(property_block)
+            .map_err(|e| anyhow::anyhow!("invalid symbol property S-expression: {e}"))?;
+        if node.head() != Some("property") {
+            continue;
+        }
+        let name = node
+            .get(1)
+            .and_then(|node| node.as_str())
+            .ok_or_else(|| anyhow::anyhow!("top-level symbol property has no name"))?;
+        let value = node
+            .get(2)
+            .and_then(|node| node.as_str())
+            .ok_or_else(|| anyhow::anyhow!("top-level symbol property '{name}' has no value"))?;
+        let spans = quoted_string_spans(property_block);
+        let (value_start, value_end) = spans.get(1).copied().ok_or_else(|| {
+            anyhow::anyhow!("top-level symbol property '{name}' has no quoted value")
+        })?;
+        properties.push(LibrarySymbolPropertyLocation {
+            name: name.to_string(),
+            value: value.to_string(),
+            value_start: start + value_start,
+            value_end: start + value_end,
+        });
+    }
+    Ok(properties)
+}
+
+fn hidden_symbol_property(name: &str, value: &str, indent: &str) -> String {
+    format!(
+        "{indent}(property \"{}\" \"{}\" (at 0 0 0) (show_name no) (do_not_autoplace no) (hide yes) (effects (font (size 1.27 1.27))))",
+        escape_library_string(name),
+        escape_library_string(value),
+    )
+}
+
+async fn handle_set_library_symbol_properties(
+    args: &serde_json::Value,
+    _ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let library_path = get_path(args, "library_path")?;
+    let symbol_name = match require_str(args, "symbol_name") {
+        Ok(value) => value,
+        Err(error) => return Ok(error),
+    };
+    let requested = match args.get("properties").and_then(|value| value.as_object()) {
+        Some(properties) if !properties.is_empty() => properties,
+        Some(_) => {
+            return Ok(invalid_arg(
+                "properties",
+                "must contain at least one property",
+            ))
+        }
+        None => {
+            return Ok(invalid_arg(
+                "properties",
+                "must be an object of string values",
+            ))
+        }
+    };
+    if requested.contains_key("Reference") {
+        return Ok(CallToolResult::error_kind(
+            ToolErrorKind::InvalidArgument {
+                field: "properties".to_string(),
+                reason: "property 'Reference' is not supported".to_string(),
+            },
+            "property 'Reference' is not supported by set_library_symbol_properties",
+        ));
+    }
+    for (name, value) in requested {
+        if name.is_empty() || name.contains('"') || name.contains('\n') || name.contains('\r') {
+            return Ok(invalid_arg(
+                "properties",
+                "property names must be non-empty and contain no quotes or newlines",
+            ));
+        }
+        if !value.is_string() {
+            return Ok(invalid_arg(
+                "properties",
+                "every property value must be a string",
+            ));
+        }
+        if value
+            .as_str()
+            .is_some_and(|value| value.contains('\n') || value.contains('\r'))
+        {
+            return Ok(invalid_arg(
+                "properties",
+                "property values must not contain newlines",
+            ));
+        }
+    }
+
+    let content = read_consistent(&library_path)?;
+    let (symbol_start, symbol_end) =
+        match direct_library_block(&content, "kicad_symbol_lib", "symbol", symbol_name) {
+            Ok(span) => span,
+            Err(_) => {
+                return Ok(CallToolResult::error_kind(
+                    ToolErrorKind::InvalidArgument {
+                        field: "symbol_name".to_string(),
+                        reason: format!("symbol '{symbol_name}' not found in library"),
+                    },
+                    format!("symbol '{symbol_name}' not found in library"),
+                ))
+            }
+        };
+    let symbol_block = &content[symbol_start..symbol_end];
+    let existing = direct_symbol_properties(symbol_block)?;
+    let mut edits = Vec::new();
+    let mut missing = Vec::new();
+    let mut old_values = serde_json::Map::new();
+    let mut sorted_requested: Vec<(&String, &serde_json::Value)> = requested.iter().collect();
+    sorted_requested.sort_by_key(|(name, _)| *name);
+    for (name, value) in sorted_requested {
+        let value = value.as_str().expect("validated property value string");
+        let matches: Vec<_> = existing
+            .iter()
+            .filter(|property| property.name == *name)
+            .collect();
+        if matches.len() > 1 {
+            return Ok(CallToolResult::error_kind(
+                ToolErrorKind::Conflict {
+                    paths: vec![library_path.display().to_string()],
+                },
+                format!("symbol '{symbol_name}' has duplicate top-level property '{name}'"),
+            ));
+        }
+        if let Some(property) = matches.first() {
+            old_values.insert(name.to_string(), json!(property.value));
+            edits.push(SexpEdit::replace(
+                symbol_start + property.value_start,
+                symbol_start + property.value_end,
+                escape_library_string(value),
+            ));
+        } else {
+            missing.push((name.as_str(), value));
+        }
+    }
+
+    if !missing.is_empty() {
+        let line_ending = if symbol_block.contains("\r\n") {
+            "\r\n"
+        } else {
+            "\n"
+        };
+        let closing_line_start = symbol_block[..symbol_block.len() - 1]
+            .rfind('\n')
+            .map(|position| position + 1)
+            .unwrap_or(symbol_block.len() - 1);
+        let closing_indent = &symbol_block[closing_line_start..symbol_block.len() - 1];
+        let child_indent = if closing_indent.chars().all(|ch| ch == '\t') {
+            format!("{closing_indent}\t")
+        } else {
+            format!("{closing_indent}  ")
+        };
+        let additions = missing
+            .iter()
+            .map(|(name, value)| hidden_symbol_property(name, value, &child_indent))
+            .collect::<Vec<_>>()
+            .join(line_ending);
+        let replacement = format!("{additions}{line_ending}{closing_indent}");
+        edits.push(SexpEdit::replace(
+            symbol_start + closing_line_start,
+            symbol_start + symbol_block.len() - 1,
+            replacement,
+        ));
+    }
+
+    let new_content = apply_edits(content.clone(), edits);
+    if new_content != content {
+        write_atomic_if_unchanged(&library_path, &content, &new_content)?;
+    }
+    let written = read_consistent(&library_path)?;
+    let (written_symbol_start, written_symbol_end) =
+        direct_library_block(&written, "kicad_symbol_lib", "symbol", symbol_name)?;
+    let written_properties =
+        direct_symbol_properties(&written[written_symbol_start..written_symbol_end])?;
+    let mut read_back = serde_json::Map::new();
+    for name in requested.keys() {
+        let matches: Vec<_> = written_properties
+            .iter()
+            .filter(|property| property.name == *name)
+            .collect();
+        if matches.len() != 1 {
+            anyhow::bail!("read-back could not find exactly one top-level property '{name}'");
+        }
+        let value = &matches[0].value;
+        let expected = requested[name].as_str().unwrap();
+        if value != expected {
+            anyhow::bail!("read-back value for property '{name}' does not match requested value");
+        }
+        read_back.insert(name.clone(), json!(value));
+    }
+    let root = parse_sexp(&written)
+        .map_err(|e| anyhow::anyhow!("library read-back is invalid KiCad S-expression: {e}"))?;
+    if root.head() != Some("kicad_symbol_lib") {
+        anyhow::bail!("library read-back root is not kicad_symbol_lib");
+    }
+    Ok(CallToolResult::text(
+        serde_json::to_string(&json!({
+            "success": true,
+            "library_path": library_path,
+            "symbol_name": symbol_name,
+            "changed": new_content != content,
+            "old_values": old_values,
+            "properties": read_back,
+            "read_back": true
+        }))
+        .unwrap(),
+    ))
 }
 
 // ─── Footprint / symbol geometry (pure, unit-tested) ──────────────────────────
@@ -10056,5 +10333,268 @@ mod required_argument_tests {
         assert!(result.is_error);
         assert_eq!(error_field(&result), "units[0].pins[1].name");
         assert!(!path.exists(), "no library may be created on rejection");
+    }
+
+    const SET_SYMBOL_PROPERTIES_LIBRARY: &str = r#"(kicad_symbol_lib
+  (version 20251024)
+  (generator "kicad_symbol_editor")
+  (generator_version "10.0")
+  (symbol "Target"
+    (property "Reference" "U" (at 0 5.08 0) (effects (font (size 1.27 1.27))))
+    (property "Value" "Target" (at 0 -5.08 0) (effects (font (size 1.27 1.27))))
+    (property "Footprint" "Old:Package" (at 0 0 0) (hide yes) (effects (font (size 1.27 1.27))))
+    (property "KeepMe" "unchanged" (at 0 0 0) (hide yes) (effects (font (size 1.27 1.27))))
+    (symbol "Target_0_1"
+      (rectangle (start -2.54 2.54) (end 2.54 -2.54) (stroke (width 0) (type default)) (fill none))
+      (pin input line (at -5.08 0 0) (length 2.54) (name "IN") (number "1"))
+    )
+  )
+)
+"#;
+
+    fn write_set_symbol_properties_fixture(dir: &std::path::Path) -> std::path::PathBuf {
+        let path = dir.join("library.kicad_sym");
+        std::fs::write(&path, SET_SYMBOL_PROPERTIES_LIBRARY).unwrap();
+        path
+    }
+
+    fn set_symbol_properties_result_text(result: &CallToolResult) -> String {
+        match result.content.first() {
+            Some(crate::mcp::protocol::ToolContent::Text { text }) => text.clone(),
+            other => panic!("expected text content, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn set_library_symbol_properties_changes_only_existing_footprint_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_set_symbol_properties_fixture(dir.path());
+        let before = std::fs::read_to_string(&path).unwrap();
+        let result = call(
+            "set_library_symbol_properties",
+            json!({
+                "library_path": path.display().to_string(),
+                "symbol_name": "Target",
+                "properties": { "Footprint": "AutoSteer_Footprints:TEENSY4.1" }
+            }),
+        )
+        .await;
+
+        assert!(!result.is_error, "update failed: {:?}", result.content);
+        let expected = before.replace(
+            "(property \"Footprint\" \"Old:Package\"",
+            "(property \"Footprint\" \"AutoSteer_Footprints:TEENSY4.1\"",
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+        let parsed = parse_sexp(&expected).unwrap();
+        let (start, end) =
+            direct_library_block(&expected, "kicad_symbol_lib", "symbol", "Target").unwrap();
+        assert_eq!(parsed.head(), Some("kicad_symbol_lib"));
+        assert_eq!(
+            direct_symbol_properties(&expected[start..end])
+                .unwrap()
+                .len(),
+            4
+        );
+        assert!(expected.contains("(rectangle "));
+        assert!(expected.contains("(pin input line"));
+    }
+
+    #[tokio::test]
+    async fn set_library_symbol_properties_updates_multiple_existing_properties() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_set_symbol_properties_fixture(dir.path());
+        let result = call(
+            "set_library_symbol_properties",
+            json!({
+                "library_path": path.display().to_string(),
+                "symbol_name": "Target",
+                "properties": {
+                    "Footprint": "New:Footprint",
+                    "Value": "Renamed target"
+                }
+            }),
+        )
+        .await;
+        assert!(!result.is_error, "update failed: {:?}", result.content);
+        let updated = std::fs::read_to_string(&path).unwrap();
+        assert!(updated.contains("(property \"Footprint\" \"New:Footprint\""));
+        assert!(updated.contains("(property \"Value\" \"Renamed target\""));
+        assert!(updated.contains("(property \"KeepMe\" \"unchanged\""));
+    }
+
+    #[tokio::test]
+    async fn set_library_symbol_properties_adds_missing_standard_properties() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("library.kicad_sym");
+        let original = SET_SYMBOL_PROPERTIES_LIBRARY.replace(
+            "    (property \"Footprint\" \"Old:Package\" (at 0 0 0) (hide yes) (effects (font (size 1.27 1.27))))\n",
+            "",
+        );
+        std::fs::write(&path, original).unwrap();
+        let result = call(
+            "set_library_symbol_properties",
+            json!({
+                "library_path": path.display().to_string(),
+                "symbol_name": "Target",
+                "properties": {
+                    "Description": "new description",
+                    "Datasheet": "https://example.test/datasheet"
+                }
+            }),
+        )
+        .await;
+        assert!(!result.is_error, "update failed: {:?}", result.content);
+        let updated = std::fs::read_to_string(&path).unwrap();
+        assert!(updated.contains("(property \"Description\" \"new description\""));
+        assert!(updated.contains("(property \"Datasheet\" \"https://example.test/datasheet\""));
+        assert!(parse_sexp(&updated).is_ok());
+    }
+
+    #[tokio::test]
+    async fn set_library_symbol_properties_adds_a_custom_property() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_set_symbol_properties_fixture(dir.path());
+        let result = call(
+            "set_library_symbol_properties",
+            json!({
+                "library_path": path.display().to_string(),
+                "symbol_name": "Target",
+                "properties": { "Manufacturer": "AutoSteer" }
+            }),
+        )
+        .await;
+        assert!(!result.is_error, "update failed: {:?}", result.content);
+        let updated = std::fs::read_to_string(&path).unwrap();
+        assert!(updated.contains("(property \"Manufacturer\" \"AutoSteer\""));
+        assert!(parse_sexp(&updated).is_ok());
+    }
+
+    #[tokio::test]
+    async fn set_library_symbol_properties_preserves_unlisted_property_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_set_symbol_properties_fixture(dir.path());
+        let before = std::fs::read_to_string(&path).unwrap();
+        let keep_before = before
+            .split("    (property \"KeepMe\"")
+            .nth(1)
+            .unwrap()
+            .split("\n")
+            .next()
+            .unwrap()
+            .to_string();
+        let result = call(
+            "set_library_symbol_properties",
+            json!({
+                "library_path": path.display().to_string(),
+                "symbol_name": "Target",
+                "properties": { "Footprint": "Changed:Package" }
+            }),
+        )
+        .await;
+        assert!(!result.is_error);
+        let after = std::fs::read_to_string(&path).unwrap();
+        let keep_after = after
+            .split("    (property \"KeepMe\"")
+            .nth(1)
+            .unwrap()
+            .split("\n")
+            .next()
+            .unwrap()
+            .to_string();
+        assert_eq!(keep_after, keep_before);
+    }
+
+    #[tokio::test]
+    async fn set_library_symbol_properties_preserves_pins_graphics_and_units() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_set_symbol_properties_fixture(dir.path());
+        let before = std::fs::read_to_string(&path).unwrap();
+        let result = call(
+            "set_library_symbol_properties",
+            json!({
+                "library_path": path.display().to_string(),
+                "symbol_name": "Target",
+                "properties": { "Footprint": "Changed:Package" }
+            }),
+        )
+        .await;
+        assert!(!result.is_error);
+        let after = std::fs::read_to_string(&path).unwrap();
+        for marker in [
+            "(symbol \"Target_0_1\"",
+            "(rectangle ",
+            "(pin input line",
+            "(number \"1\")",
+        ] {
+            assert_eq!(
+                before.matches(marker).count(),
+                after.matches(marker).count(),
+                "marker {marker}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn set_library_symbol_properties_refuses_a_missing_symbol_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_set_symbol_properties_fixture(dir.path());
+        let before = std::fs::read(&path).unwrap();
+        let result = call(
+            "set_library_symbol_properties",
+            json!({
+                "library_path": path.display().to_string(),
+                "symbol_name": "Missing",
+                "properties": { "Footprint": "New:Package" }
+            }),
+        )
+        .await;
+        assert!(result.is_error);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn set_library_symbol_properties_refuses_an_empty_map_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_set_symbol_properties_fixture(dir.path());
+        let before = std::fs::read(&path).unwrap();
+        let result = call(
+            "set_library_symbol_properties",
+            json!({
+                "library_path": path.display().to_string(),
+                "symbol_name": "Target",
+                "properties": {}
+            }),
+        )
+        .await;
+        assert!(result.is_error);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn set_library_symbol_properties_readback_confirms_every_requested_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_set_symbol_properties_fixture(dir.path());
+        let result = call(
+            "set_library_symbol_properties",
+            json!({
+                "library_path": path.display().to_string(),
+                "symbol_name": "Target",
+                "properties": {
+                    "Footprint": "Readback:Footprint",
+                    "Manufacturer": "Readback Manufacturer"
+                }
+            }),
+        )
+        .await;
+        assert!(!result.is_error, "update failed: {:?}", result.content);
+        let text = set_symbol_properties_result_text(&result);
+        let output: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(output["read_back"], true);
+        assert_eq!(output["properties"]["Footprint"], "Readback:Footprint");
+        assert_eq!(
+            output["properties"]["Manufacturer"],
+            "Readback Manufacturer"
+        );
     }
 }

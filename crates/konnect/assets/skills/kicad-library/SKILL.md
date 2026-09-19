@@ -20,6 +20,7 @@ using Konnect MCP tools. ALL modifications go through MCP tools — never edit
 
 ```
 load_toolset('library')    # search_symbols, search_footprints, create_symbol, create_footprint,
+                           # set_library_symbol_properties,
                            # edit_footprint_pad, set_footprint_graphics, set_footprint_metadata,
                            # set_footprint_models, get_footprint_info, register_symbol_library,
                            # register_footprint_library, get_symbol_info
@@ -390,6 +391,19 @@ set_footprint_models(
 ```
 register_symbol_library(nickname, library_path, scope?, project?, replace_existing?)
 ```
+
+### Update Symbol Properties
+
+```
+set_library_symbol_properties(library_path, symbol_name, properties)
+```
+
+Updates or adds only the named top-level symbol properties through targeted
+S-expression edits and an atomic, revision-aware write. Existing values are
+replaced in place; missing properties are added as hidden top-level properties.
+The `Reference` property is refused, and the tool reads the symbol back before
+reporting success. Pins, units, graphics, UUIDs, and unlisted properties are
+preserved.
 
 ### Register a Footprint Library
 

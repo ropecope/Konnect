@@ -338,7 +338,7 @@ and Windows servers do not.
 
 ## Library
 
-### `library` · 17 tools
+### `library` · 18 tools
 **Purpose:** Search, register, and author symbol and footprint libraries — create symbols and footprints, edit pads, graphics, metadata and 3D models.
 **Source:** [`crates/konnect-core/src/tools/library.rs`](crates/konnect-core/src/tools/library.rs)
 
@@ -353,6 +353,7 @@ and Windows servers do not.
 | `register_footprint_library` | Register a local footprint library directory in the KiCAD global or project library table. Set `replace_existing` to update a stale URI in place while preserving entry metadata. |
 | `list_footprint_libraries` | List all registered footprint libraries (global and/or project). |
 | `create_symbol` | Create a new KiCAD schematic symbol and append it to a `.kicad_sym` library. |
+| `set_library_symbol_properties` | Atomically update or add selected top-level properties on one exact `.kicad_sym` symbol, preserving all unlisted source bytes and returning read-back values. `Reference` is refused. |
 | `copy_symbol_to_library` | Copy one exact top-level symbol definition into another `.kicad_sym` library without reconstruction; optional rename and explicit overwrite. Symbols with unresolved `extends` dependencies are refused. |
 | `delete_symbol` | Delete a symbol definition from a `.kicad_sym` library. |
 | `list_symbols_in_library` | List all symbol names defined in a `.kicad_sym` library file. |
