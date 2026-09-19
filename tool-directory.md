@@ -345,7 +345,6 @@ and Windows servers do not.
 | Tool | Description |
 |------|-------------|
 | `create_footprint` | Create a new footprint (`.kicad_mod`) file from a pad layout description. |
-| `copy_footprint_to_library` | Copy an existing `.kicad_mod` footprint as a validated balanced S-expression block into a `.pretty` library, preserving source content; optional rename and explicit overwrite. |
 | `edit_footprint_pad` | Atomically edit or renumber matching pads, including valid circle/rect/oval/roundrect shape transitions and independent dimensions. |
 | `set_footprint_graphics` | Atomically append, replace, or delete line, arc, rectangle, circle, and polygon primitives on one footprint layer. Replacement/deletion preserves unrelated source and rejects graphics referenced by a group. |
 | `set_footprint_metadata` | Atomically replace a footprint description, tags, or supported attributes while preserving unrelated source. Empty tags or attributes remove their block. |
@@ -354,7 +353,6 @@ and Windows servers do not.
 | `list_footprint_libraries` | List all registered footprint libraries (global and/or project). |
 | `create_symbol` | Create a new KiCAD schematic symbol and append it to a `.kicad_sym` library. |
 | `set_library_symbol_properties` | Atomically update or add selected top-level properties on one exact `.kicad_sym` symbol, preserving all unlisted source bytes and returning read-back values. `Reference` is refused. |
-| `copy_symbol_to_library` | Copy one exact top-level symbol definition into another `.kicad_sym` library without reconstruction; optional rename and explicit overwrite. Symbols with unresolved `extends` dependencies are refused. |
 | `delete_symbol` | Delete a symbol definition from a `.kicad_sym` library. |
 | `list_symbols_in_library` | List all symbol names defined in a `.kicad_sym` library file. |
 | `register_symbol_library` | Register a `.kicad_sym` library file in the KiCAD global or project symbol table. Reports `inserted`/`unchanged`/`updated`; set `replace_existing` to update a stale URI in place while preserving entry metadata. |
@@ -364,6 +362,17 @@ and Windows servers do not.
 | `get_footprint_info` | Return detailed information about a footprint. Set `include_graphics` (and optionally `graphics_layer`) to inspect supported top-level primitives, geometry, stroke, fill, and item IDs. |
 | `search_footprints` | Search for footprints across all registered libraries by name or keyword. |
 | `get_symbol_info` | Return detailed information about a schematic symbol: pins, properties, description. |
+
+### `library_transfer` · 4 tools
+
+**Purpose:** Copy library items or extract definitions embedded in schematics/boards without reconstructing them.
+
+| Tool | Description |
+|------|-------------|
+| `copy_footprint_to_library` | Copy an existing `.kicad_mod` footprint into a `.pretty` library, preserving source content; optional rename and explicit overwrite. |
+| `copy_symbol_to_library` | Copy one exact top-level symbol definition without reconstruction; optional rename and explicit overwrite. |
+| `extract_footprint_from_board` | Extract a placed footprint selected by exact Reference, strip board-instance state, and preserve footprint-local pad/graphics coordinates and 3D transforms. Refuses ambiguous Reference matches and back-side instances. |
+| `extract_symbol_from_schematic` | Extract one exact embedded symbol, flatten embedded inheritance, and rename root and internal unit child names consistently. |
 
 ---
 

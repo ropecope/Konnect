@@ -24,6 +24,8 @@ load_toolset('library')    # search_symbols, search_footprints, create_symbol, c
                            # edit_footprint_pad, set_footprint_graphics, set_footprint_metadata,
                            # set_footprint_models, get_footprint_info, register_symbol_library,
                            # register_footprint_library, get_symbol_info
+load_toolset('library_transfer') # copy_symbol_to_library, copy_footprint_to_library,
+                                 # extract_symbol_from_schematic, extract_footprint_from_board
 load_toolset('pcb_components') # update_footprints_from_library for placed instances
 ```
 
@@ -68,6 +70,16 @@ update_footprints_from_library(
 ---
 
 ## Search First Principle
+
+### Extract V4-embedded library definitions
+
+Use `extract_symbol_from_schematic` with an exact embedded `lib_id` when the
+schematic is the authority. A rename updates both the top-level symbol and all
+internal unit-child names. Use `extract_footprint_from_board` only with a unique
+exact Reference; duplicate matches (including board-only `REF**` placements)
+are refused. The tool removes the board placement while retaining local pad and
+graphic coordinates and 3D transforms. Back-side instances are refused because
+their board flip cannot be safely normalized by simply removing placement.
 
 **Always search existing libraries before creating custom components.**
 

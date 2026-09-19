@@ -106,9 +106,15 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
     },
     ToolsetMeta {
         name: "library",
-        description: "Search, register, and author symbol and footprint libraries — create symbols and footprints, edit pads, graphics, metadata and 3D models",
+        description: "Search and manage libraries; create symbols and footprints, edit pads, graphics, metadata and 3D models",
         category: "library",
-        tool_count: 20,
+        tool_count: 18,
+    },
+    ToolsetMeta {
+        name: "library_transfer",
+        description: "Copy library items or extract embedded symbol and footprint definitions without reconstruction",
+        category: "library",
+        tool_count: 4,
     },
     ToolsetMeta {
         name: "integration",
@@ -186,7 +192,8 @@ fn build_tools_for(name: &str) -> Option<Vec<ToolDef>> {
         "pcb_routing" => Some(pcb_routing::tools()),
         "placement" => Some(placement::tools()),
         "pcb_export" => Some(pcb_export::tools()),
-        "library" => Some(library::tools()),
+        "library" => Some(library::authoring_tools()),
+        "library_transfer" => Some(library::transfer_tools()),
         "integration" => Some(integration::tools()),
         "verification" => Some(verification::tools()),
         "config" => Some(config::tools()),

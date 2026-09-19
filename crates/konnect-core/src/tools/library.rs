@@ -340,6 +340,38 @@ pub fn tools() -> Vec<ToolDef> {
             |args, ctx| async move { handle_copy_symbol_to_library(args, ctx).await }
         ),
         tool!(
+            "extract_symbol_from_schematic",
+            "Extract one exact embedded symbol definition from a schematic into a symbol library without reconstructing it. Inherited symbols are flattened from the schematic's embedded library definitions.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "schematic": { "type": "string", "description": "Source .kicad_sch file" },
+                    "symbol_id": { "type": "string", "description": "Exact embedded lib_id, including nickname (e.g. Device:R)" },
+                    "destination_library": { "type": "string", "description": "Destination .kicad_sym library" },
+                    "new_name": { "type": "string", "description": "Optional unqualified destination symbol name" },
+                    "overwrite": { "type": "boolean", "default": false }
+                },
+                "required": ["schematic", "symbol_id", "destination_library"]
+            }),
+            |args, ctx| async move { handle_extract_symbol_from_schematic(args, ctx).await }
+        ),
+        tool!(
+            "extract_footprint_from_board",
+            "Extract one exact placed footprint definition from a board into a .pretty library, removing board-instance state while preserving footprint-local geometry and 3D model transforms. Refuses duplicate Reference matches and back-side instances whose flip transform cannot be safely normalized.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board": { "type": "string", "description": "Source .kicad_pcb file" },
+                    "reference": { "type": "string", "description": "Exact board footprint Reference" },
+                    "destination_library": { "type": "string", "description": "Destination .pretty directory" },
+                    "new_name": { "type": "string", "description": "Optional destination footprint name" },
+                    "overwrite": { "type": "boolean", "default": false }
+                },
+                "required": ["board", "reference", "destination_library"]
+            }),
+            |args, ctx| async move { handle_extract_footprint_from_board(args, ctx).await }
+        ),
+        tool!(
             "list_symbols_in_library",
             "List all symbol names defined in a .kicad_sym library file.",
             json!({
@@ -487,6 +519,38 @@ pub fn tools() -> Vec<ToolDef> {
     tools
 }
 
+/// Copy and embedded-design extraction operations are kept in a small sibling
+/// toolbox so the library authoring toolbox stays within the router's size cap.
+pub fn transfer_tools() -> Vec<ToolDef> {
+    tools()
+        .into_iter()
+        .filter(|tool| {
+            matches!(
+                tool.name,
+                "copy_footprint_to_library"
+                    | "copy_symbol_to_library"
+                    | "extract_footprint_from_board"
+                    | "extract_symbol_from_schematic"
+            )
+        })
+        .collect()
+}
+
+pub fn authoring_tools() -> Vec<ToolDef> {
+    tools()
+        .into_iter()
+        .filter(|tool| {
+            !matches!(
+                tool.name,
+                "copy_footprint_to_library"
+                    | "copy_symbol_to_library"
+                    | "extract_footprint_from_board"
+                    | "extract_symbol_from_schematic"
+            )
+        })
+        .collect()
+}
+
 // ─── Handlers ─────────────────────────────────────────────────────────────────
 
 fn renamed_library_block(block: &str, tag: &str, new_name: Option<&str>) -> anyhow::Result<String> {
@@ -496,14 +560,13 @@ fn renamed_library_block(block: &str, tag: &str, new_name: Option<&str>) -> anyh
     if new_name.is_empty() || new_name.contains('"') || new_name.contains('\n') {
         anyhow::bail!("new_name must be a non-empty KiCad name without quotes or newlines");
     }
-    let prefix = format!("({tag} \"");
-    let start = block
-        .find(&prefix)
-        .ok_or_else(|| anyhow::anyhow!("valid {tag} root not found"))?
-        + prefix.len();
-    let end = block[start..]
-        .find('"')
-        .map(|i| start + i)
+    let root = parse_sexp(block).map_err(|e| anyhow::anyhow!("invalid {tag} item: {e}"))?;
+    if root.head() != Some(tag) {
+        anyhow::bail!("valid {tag} root not found");
+    }
+    let (start, end) = quoted_string_spans(block)
+        .into_iter()
+        .next()
         .ok_or_else(|| anyhow::anyhow!("{tag} name is not quoted"))?;
     let mut out = block.to_string();
     out.replace_range(start..end, new_name);
@@ -648,6 +711,404 @@ async fn handle_copy_symbol_to_library(
     let written = read_consistent(&destination)?;
     direct_library_block(&written, "kicad_symbol_lib", "symbol", destination_name)?;
     Ok(CallToolResult::text(serde_json::to_string(&json!({"success":true,"source":source,"destination":destination,"name":destination_name,"overwritten":existing})).unwrap()))
+}
+
+fn safe_library_item_name(name: &str) -> anyhow::Result<()> {
+    if name.is_empty() || name.contains(['"', '\n', '\r', '/', '\\']) || name == "." || name == ".."
+    {
+        anyhow::bail!("new_name must be a non-empty KiCad item name without path separators");
+    }
+    Ok(())
+}
+
+fn symbol_id_from_embedded_block(block: &str) -> anyhow::Result<String> {
+    let node = parse_sexp(block).map_err(|e| anyhow::anyhow!("invalid embedded symbol: {e}"))?;
+    if node.head() != Some("symbol") {
+        anyhow::bail!("embedded library item is not a symbol");
+    }
+    node.get(1)
+        .and_then(SexpNode::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| anyhow::anyhow!("embedded symbol has no library id"))
+}
+
+fn embedded_symbol_block<'a>(schematic: &'a str, symbol_id: &str) -> anyhow::Result<&'a str> {
+    let root = parse_sexp(schematic).map_err(|e| anyhow::anyhow!("invalid schematic: {e}"))?;
+    if root.head() != Some("kicad_sch") {
+        anyhow::bail!("source root must be kicad_sch");
+    }
+    let schematic_children = find_direct_child_blocks(schematic, "kicad_sch");
+    let Some((lib_start, lib_end)) = schematic_children.into_iter().find(|(start, end)| {
+        parse_sexp(&schematic[*start..*end])
+            .ok()
+            .is_some_and(|n| n.head() == Some("lib_symbols"))
+    }) else {
+        anyhow::bail!("schematic has no lib_symbols section");
+    };
+    let lib_symbols = &schematic[lib_start..lib_end];
+    let mut found = None;
+    for (start, end) in find_direct_child_blocks(lib_symbols, "lib_symbols") {
+        if symbol_id_from_embedded_block(&lib_symbols[start..end])? == symbol_id
+            && found.replace(&lib_symbols[start..end]).is_some()
+        {
+            anyhow::bail!("schematic contains duplicate embedded definitions for '{symbol_id}'");
+        }
+    }
+    found.ok_or_else(|| anyhow::anyhow!("embedded symbol '{symbol_id}' not found in schematic"))
+}
+
+fn rename_symbol_definition(block: &str, new_name: &str) -> anyhow::Result<String> {
+    safe_library_item_name(new_name)?;
+    let old_id = symbol_id_from_embedded_block(block)?;
+    let old_name = old_id.rsplit(':').next().unwrap_or(&old_id);
+    let mut renamed = renamed_library_block(block, "symbol", Some(new_name))?;
+    let mut edits = Vec::new();
+    for (start, end) in find_direct_child_blocks(&renamed, "symbol") {
+        let unit = parse_sexp(&renamed[start..end])?;
+        let Some(unit_name) = unit.get(1).and_then(SexpNode::as_str) else {
+            continue;
+        };
+        let Some(suffix) = unit_name.strip_prefix(old_name) else {
+            continue;
+        };
+        if !suffix.starts_with('_') {
+            continue;
+        }
+        let spans = quoted_string_spans(&renamed[start..end]);
+        let Some((value_start, value_end)) = spans.first().copied() else {
+            continue;
+        };
+        edits.push(SexpEdit::replace(
+            start + value_start - 1,
+            start + value_end + 1,
+            format!("\"{new_name}{suffix}\""),
+        ));
+    }
+    if !edits.is_empty() {
+        renamed = apply_edits(renamed, edits);
+    }
+    parse_sexp(&renamed).map_err(|e| anyhow::anyhow!("renamed symbol is invalid: {e}"))?;
+    Ok(renamed)
+}
+
+/// Resolve an embedded definition, including an `extends` chain, using only
+/// the symbol blocks embedded in the same schematic. Temporary library files
+/// let the existing KiCad resolver apply its tested inheritance semantics.
+fn flattened_embedded_symbol(schematic: &str, symbol_id: &str) -> anyhow::Result<String> {
+    let direct = embedded_symbol_block(schematic, symbol_id)?;
+    let direct_node = parse_sexp(direct)?;
+    if direct_node.find("extends").is_none() {
+        return Ok(direct.to_string());
+    }
+
+    let children = find_direct_child_blocks(schematic, "kicad_sch");
+    let (lib_start, lib_end) = children
+        .into_iter()
+        .find(|(start, end)| {
+            parse_sexp(&schematic[*start..*end])
+                .ok()
+                .is_some_and(|n| n.head() == Some("lib_symbols"))
+        })
+        .ok_or_else(|| anyhow::anyhow!("schematic has no lib_symbols section"))?;
+    let lib_block = &schematic[lib_start..lib_end];
+    let mut groups: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    for (start, end) in find_direct_child_blocks(lib_block, "lib_symbols") {
+        let block = &lib_block[start..end];
+        let id = symbol_id_from_embedded_block(block)?;
+        let Some((nickname, name)) = id.split_once(':') else {
+            anyhow::bail!("embedded symbol id '{id}' is not library-qualified");
+        };
+        let mut plain = renamed_library_block(block, "symbol", Some(name))?;
+        let edits = find_direct_child_blocks(&plain, "symbol")
+            .into_iter()
+            .filter_map(|(start, end)| {
+                let child = parse_sexp(&plain[start..end]).ok()?;
+                if child.head() != Some("extends") {
+                    return None;
+                }
+                let parent_id = child.get(1).and_then(SexpNode::as_str)?;
+                let parent_name = parent_id.strip_prefix(&format!("{nickname}:"))?;
+                let needle = format!("\"{parent_id}\"");
+                let value_start = plain[start..end].find(&needle)? + start + 1;
+                Some(SexpEdit::replace(
+                    value_start,
+                    value_start + parent_id.len(),
+                    parent_name.to_string(),
+                ))
+            })
+            .collect::<Vec<_>>();
+        if !edits.is_empty() {
+            plain = apply_edits(plain, edits);
+        }
+        groups.entry(nickname.to_string()).or_default().push(plain);
+    }
+    let temp = tempfile::tempdir()?;
+    let mut paths = std::collections::HashMap::new();
+    for (nickname, blocks) in groups {
+        let path = temp.path().join(format!("{nickname}.kicad_sym"));
+        let mut library =
+            String::from("(kicad_symbol_lib (version 20231120) (generator kicad_symbol_editor)\n");
+        for block in blocks {
+            library.push_str(&block);
+            library.push('\n');
+        }
+        library.push_str(")\n");
+        std::fs::write(&path, library)?;
+        paths.insert(nickname, path);
+    }
+    let source = |nickname: &str| paths.get(nickname).cloned().into_iter().collect::<Vec<_>>();
+    konnect_schematic_editor::library::resolve_lib_symbol_flattened(symbol_id, &source)
+        .map(|resolved| resolved.trim().to_string())
+        .ok_or_else(|| {
+            anyhow::anyhow!("could not resolve embedded extends chain for '{symbol_id}'")
+        })
+}
+
+async fn handle_extract_symbol_from_schematic(
+    args: &serde_json::Value,
+    _ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let schematic = get_path(args, "schematic")?;
+    let destination = get_path(args, "destination_library")?;
+    let symbol_id = match require_str(args, "symbol_id") {
+        Ok(value) => value,
+        Err(_) => anyhow::bail!("symbol_id is missing or not a string"),
+    };
+    let overwrite = args["overwrite"].as_bool().unwrap_or(false);
+    let source_content = read_consistent(&schematic)?;
+    let source_block = flattened_embedded_symbol(&source_content, symbol_id)?;
+    let destination_name = args["new_name"]
+        .as_str()
+        .unwrap_or_else(|| symbol_id.rsplit(':').next().unwrap_or(symbol_id));
+    let block = rename_symbol_definition(&source_block, destination_name)?;
+    let destination_content = if destination.exists() {
+        read_consistent(&destination)?
+    } else {
+        "(kicad_symbol_lib (version 20231120) (generator kicad_symbol_editor))\n".to_string()
+    };
+    let root = parse_sexp(&destination_content)
+        .map_err(|e| anyhow::anyhow!("invalid destination symbol library: {e}"))?;
+    if root.head() != Some("kicad_symbol_lib") {
+        anyhow::bail!("destination root must be kicad_symbol_lib");
+    }
+    let existing = root
+        .find_all("symbol")
+        .iter()
+        .any(|n| n.get(1).and_then(SexpNode::as_str) == Some(destination_name));
+    if existing && !overwrite {
+        anyhow::bail!("destination symbol already exists: {destination_name}");
+    }
+    let root_start = find_block_starts(&destination_content, "kicad_symbol_lib")
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("destination root not found"))?;
+    let (_, root_end) = find_balanced_block(&destination_content, root_start)
+        .ok_or_else(|| anyhow::anyhow!("destination root is unbalanced"))?;
+    let mut new_content = if existing {
+        let (start, end) = direct_library_block(
+            &destination_content,
+            "kicad_symbol_lib",
+            "symbol",
+            destination_name,
+        )?;
+        apply_edits(
+            destination_content.clone(),
+            vec![SexpEdit::replace(start, end, block.clone())],
+        )
+    } else {
+        apply_edits(
+            destination_content.clone(),
+            vec![SexpEdit::insert(root_end - 1, format!("\n  {block}\n"))],
+        )
+    };
+    if destination.exists() {
+        let expected = read_consistent(&destination)?;
+        write_atomic_if_unchanged(&destination, &expected, &new_content)?;
+    } else {
+        write_new_atomic(&destination, &new_content)?;
+    }
+    new_content = read_consistent(&destination)?;
+    let (start, end) =
+        direct_library_block(&new_content, "kicad_symbol_lib", "symbol", destination_name)?;
+    let read_back = parse_sexp(&new_content[start..end])?;
+    if read_back.find("extends").is_some() {
+        anyhow::bail!("symbol read-back retained an unresolved extends dependency");
+    }
+    Ok(CallToolResult::text(serde_json::to_string(&json!({
+        "success": true,
+        "source": schematic,
+        "symbol_id": symbol_id,
+        "destination": destination,
+        "symbol_name": destination_name,
+        "overwritten": existing,
+        "read_back": true,
+        "pin_count": read_back.find_all("pin").len()
+    }))?))
+}
+
+fn board_footprint_reference(node: &SexpNode) -> Option<&str> {
+    node.find_all("property")
+        .into_iter()
+        .find(|p| p.get(1).and_then(SexpNode::as_str) == Some("Reference"))
+        .and_then(|p| p.get(2))
+        .and_then(SexpNode::as_str)
+        .or_else(|| {
+            node.find_all("fp_text")
+                .into_iter()
+                .find(|p| p.get(1).and_then(SexpNode::as_str) == Some("reference"))
+                .and_then(|p| p.get(2))
+                .and_then(SexpNode::as_str)
+        })
+}
+
+fn strip_board_footprint_state(block: &str, name: &str) -> anyhow::Result<String> {
+    safe_library_item_name(name)?;
+    let root = parse_sexp(block).map_err(|e| anyhow::anyhow!("invalid board footprint: {e}"))?;
+    if root.head() != Some("footprint") {
+        anyhow::bail!("board item is not a footprint");
+    }
+    let mut edits = Vec::new();
+    for (start, end) in find_direct_child_blocks(block, "footprint") {
+        let child = parse_sexp(&block[start..end])?;
+        match child.head() {
+            Some("at" | "tstamp" | "uuid" | "path" | "locked" | "sheetname" | "sheetfile") => {
+                edits.push(SexpEdit::replace(start, end, String::new()));
+            }
+            Some("property") => {
+                let property = child.get(1).and_then(SexpNode::as_str).unwrap_or("");
+                if matches!(property, "Reference" | "Value") {
+                    let spans = quoted_string_spans(&block[start..end]);
+                    if let Some((value_start, value_end)) = spans.get(1).copied() {
+                        let value = if property == "Reference" {
+                            "REF**"
+                        } else {
+                            name
+                        };
+                        edits.push(SexpEdit::replace(
+                            start + value_start,
+                            start + value_end,
+                            value.to_string(),
+                        ));
+                    }
+                }
+            }
+            Some("pad") => {
+                for (net_start, net_end) in find_direct_child_blocks(&block[start..end], "pad") {
+                    let nested = parse_sexp(&block[start + net_start..start + net_end])?;
+                    if matches!(nested.head(), Some("net" | "pinfunction" | "pintype")) {
+                        edits.push(SexpEdit::replace(
+                            start + net_start,
+                            start + net_end,
+                            String::new(),
+                        ));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut clean = apply_edits(block.to_string(), edits);
+    clean = renamed_library_block(&clean, "footprint", Some(name))?;
+    let parsed =
+        parse_sexp(&clean).map_err(|e| anyhow::anyhow!("extracted footprint is invalid: {e}"))?;
+    if parsed.head() != Some("footprint")
+        || parsed.get(1).and_then(SexpNode::as_str) != Some(name)
+        || parsed.find("at").is_some()
+        || parsed.find("path").is_some()
+    {
+        anyhow::bail!("board-instance state remained in extracted footprint");
+    }
+    for pad in parsed.find_all("pad") {
+        if pad.find("net").is_some() {
+            anyhow::bail!("net assignment remained in extracted footprint");
+        }
+    }
+    Ok(clean)
+}
+
+async fn handle_extract_footprint_from_board(
+    args: &serde_json::Value,
+    _ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let board = get_path(args, "board")?;
+    let destination_library = get_path(args, "destination_library")?;
+    let reference = match require_str(args, "reference") {
+        Ok(value) => value,
+        Err(_) => anyhow::bail!("reference is missing or not a string"),
+    };
+    let overwrite = args["overwrite"].as_bool().unwrap_or(false);
+    let content = read_consistent(&board)?;
+    let root = parse_sexp(&content).map_err(|e| anyhow::anyhow!("invalid board: {e}"))?;
+    if root.head() != Some("kicad_pcb") {
+        anyhow::bail!("source root must be kicad_pcb");
+    }
+    let mut selected = None;
+    for (start, end) in find_direct_child_blocks(&content, "kicad_pcb") {
+        let block = &content[start..end];
+        let node = match parse_sexp(block) {
+            Ok(n) if n.head() == Some("footprint") => n,
+            _ => continue,
+        };
+        if board_footprint_reference(&node) == Some(reference) && selected.replace(block).is_some()
+        {
+            anyhow::bail!("board contains duplicate footprint Reference '{reference}'");
+        }
+    }
+    let source_block = selected
+        .ok_or_else(|| anyhow::anyhow!("footprint Reference '{reference}' not found on board"))?;
+    let source_node = parse_sexp(source_block)?;
+    if source_node
+        .find("layer")
+        .and_then(|node| node.get(1))
+        .and_then(SexpNode::as_str)
+        == Some("B.Cu")
+    {
+        anyhow::bail!(
+            "cannot extract back-side footprint '{reference}' safely; select a front-side instance so local coordinates are unambiguous"
+        );
+    }
+    let original_id = source_node
+        .get(1)
+        .and_then(SexpNode::as_str)
+        .ok_or_else(|| anyhow::anyhow!("board footprint has no library id"))?;
+    let destination_name = args["new_name"]
+        .as_str()
+        .unwrap_or_else(|| original_id.rsplit(':').next().unwrap_or(original_id));
+    let clean = strip_board_footprint_state(source_block, destination_name)?;
+    std::fs::create_dir_all(&destination_library)?;
+    let output = destination_library.join(format!("{destination_name}.kicad_mod"));
+    let existed = output.exists();
+    if existed && !overwrite {
+        anyhow::bail!("destination footprint already exists: {}", output.display());
+    }
+    if existed {
+        let expected = read_consistent(&output)?;
+        write_atomic_if_unchanged(&output, &expected, &clean)?;
+    } else {
+        write_new_atomic(&output, &clean)?;
+    }
+    let written = read_consistent(&output)?;
+    let read_back = parse_sexp(&written)
+        .map_err(|e| anyhow::anyhow!("destination read-back is invalid: {e}"))?;
+    if read_back.head() != Some("footprint")
+        || read_back.get(1).and_then(SexpNode::as_str) != Some(destination_name)
+    {
+        anyhow::bail!("destination read-back does not match requested footprint");
+    }
+    Ok(CallToolResult::text(serde_json::to_string(&json!({
+        "success": true,
+        "source": board,
+        "reference": reference,
+        "legacy_footprint_id": original_id,
+        "destination": output,
+        "footprint_name": destination_name,
+        "overwritten": existed,
+        "pad_count": read_back.find_all("pad").len(),
+        "model_count": read_back.find_all("model").len(),
+        "coordinates": "footprint_local",
+        "read_back": true
+    }))?))
 }
 
 /// Locate direct top-level properties on one exact symbol. The returned byte
@@ -8148,6 +8609,17 @@ mod tests {
             .unwrap_or_else(|e| panic!("{name} must not bubble an anyhow error: {e}"))
     }
 
+    async fn call_library_tool_error(name: &str, args: serde_json::Value) -> String {
+        let tool = tools()
+            .into_iter()
+            .find(|tool| tool.name == name)
+            .unwrap_or_else(|| panic!("library must expose {name}"));
+        (tool.handler)(&args, Arc::new(test_ctx()))
+            .await
+            .expect_err("the request must be refused")
+            .to_string()
+    }
+
     #[tokio::test]
     async fn copy_symbol_to_library_creates_missing_destination_and_preserves_symbol_data() {
         let tmp = tempfile::tempdir().unwrap();
@@ -8303,6 +8775,288 @@ mod tests {
             .to_string()
             .contains("destination footprint already exists"));
         assert_eq!(std::fs::read(&destination).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn extract_symbol_from_schematic_preserves_embedded_definition_and_renames_units() {
+        let tmp = tempfile::tempdir().unwrap();
+        let schematic = tmp.path().join("source.kicad_sch");
+        let destination = tmp.path().join("clean.kicad_sym");
+        let source = r#"(kicad_sch
+  (version 20250114)
+  (lib_symbols
+    (symbol "Legacy:Part"
+      (property "Reference" "U" (at 0 5 0))
+      (property "Value" "Original" (at 0 -5 0))
+      (property "Footprint" "Old:Pkg" (at 0 0 0))
+      (symbol "Part_1_1"
+        (rectangle (start -2 2) (end 2 -2) (stroke (width 0) (type default)) (fill none))
+        (pin input line (at -5 0 0) (length 3) (name "IN") (number "1"))
+      )
+    )
+  )
+)
+"#;
+        std::fs::write(&schematic, source).unwrap();
+        let result = call_library_tool(
+            "extract_symbol_from_schematic",
+            json!({
+                "schematic": schematic.to_string_lossy(),
+                "symbol_id": "Legacy:Part",
+                "destination_library": destination.to_string_lossy(),
+                "new_name": "Canonical"
+            }),
+        )
+        .await;
+        assert!(!result.is_error, "extract failed: {:?}", result.content);
+        let text = std::fs::read_to_string(&destination).unwrap();
+        assert!(text.contains("(symbol \"Canonical\""));
+        assert!(text.contains("(symbol \"Canonical_1_1\""));
+        assert!(text.contains("(rectangle "));
+        assert!(text.contains("(pin input line"));
+        assert!(text.contains("(property \"Value\" \"Original\""));
+        assert_eq!(std::fs::read_to_string(&schematic).unwrap(), source);
+    }
+
+    #[tokio::test]
+    async fn extract_symbol_renames_all_internal_unit_child_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let schematic = tmp.path().join("source.kicad_sch");
+        let destination = tmp.path().join("clean.kicad_sym");
+        let source = r#"(kicad_sch
+  (version 20250114)
+  (lib_symbols
+    (symbol "Legacy:Multi"
+      (property "Reference" "U" (at 0 5 0))
+      (property "Value" "Multi" (at 0 -5 0))
+      (symbol "Multi_1_0"
+        (rectangle (start -2 2) (end 2 -2) (stroke (width 0) (type default)) (fill none))
+      )
+      (symbol "Multi_1_1"
+        (pin input line (at -5 0 0) (length 3) (name "IN") (number "1"))
+      )
+      (symbol "Multi_2_0"
+        (polyline (pts (xy -2 0) (xy 2 0)) (stroke (width 0) (type default)) (fill none))
+      )
+    )
+  )
+)
+"#;
+        std::fs::write(&schematic, source).unwrap();
+        let result = call_library_tool(
+            "extract_symbol_from_schematic",
+            json!({
+                "schematic": schematic.to_string_lossy(),
+                "symbol_id": "Legacy:Multi",
+                "destination_library": destination.to_string_lossy(),
+                "new_name": "CanonicalMulti"
+            }),
+        )
+        .await;
+        assert!(!result.is_error, "extract failed: {:?}", result.content);
+        let text = std::fs::read_to_string(&destination).unwrap();
+        for unit in [
+            "CanonicalMulti_1_0",
+            "CanonicalMulti_1_1",
+            "CanonicalMulti_2_0",
+        ] {
+            assert!(text.contains(&format!("(symbol \"{unit}\"")), "{text}");
+        }
+        assert!(!text.contains("(symbol \"Multi_"), "{text}");
+        assert!(text.contains("(rectangle "));
+        assert!(text.contains("(polyline "));
+        assert!(text.contains("(number \"1\")"));
+    }
+
+    #[tokio::test]
+    async fn extract_symbol_from_schematic_flattens_embedded_extends_chain() {
+        let tmp = tempfile::tempdir().unwrap();
+        let schematic = tmp.path().join("derived.kicad_sch");
+        let destination = tmp.path().join("derived.kicad_sym");
+        let source = r#"(kicad_sch
+  (version 20250114)
+  (lib_symbols
+    (symbol "Legacy:Base"
+      (property "Reference" "U" (at 0 5 0))
+      (property "Value" "Base" (at 0 -5 0))
+      (symbol "Base_1_1"
+        (pin input line (at -5 0 0) (length 3) (name "IN") (number "1"))
+      )
+    )
+    (symbol "Legacy:Derived"
+      (extends "Legacy:Base")
+      (property "Value" "Derived" (at 0 -5 0))
+    )
+  )
+)
+"#;
+        std::fs::write(&schematic, source).unwrap();
+        let result = call_library_tool(
+            "extract_symbol_from_schematic",
+            json!({
+                "schematic": schematic.to_string_lossy(),
+                "symbol_id": "Legacy:Derived",
+                "destination_library": destination.to_string_lossy(),
+                "new_name": "DerivedClean"
+            }),
+        )
+        .await;
+        assert!(!result.is_error, "extract failed: {:?}", result.content);
+        let text = std::fs::read_to_string(&destination).unwrap();
+        assert!(!text.contains("(extends "), "{text}");
+        assert!(text.contains("(symbol \"DerivedClean_1_1\""), "{text}");
+        assert!(text.contains("(number \"1\")"), "{text}");
+        assert!(text.contains("(property \"Reference\" \"U\""), "{text}");
+        assert!(text.contains("(property \"Value\" \"Derived\""), "{text}");
+    }
+
+    #[tokio::test]
+    async fn extract_symbol_from_schematic_refuses_missing_id_without_writing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let schematic = tmp.path().join("source.kicad_sch");
+        let destination = tmp.path().join("clean.kicad_sym");
+        std::fs::write(
+            &schematic,
+            "(kicad_sch (lib_symbols (symbol \"Legacy:Exists\")))",
+        )
+        .unwrap();
+        let error = call_library_tool_error(
+            "extract_symbol_from_schematic",
+            json!({
+                "schematic": schematic.to_string_lossy(),
+                "symbol_id": "Legacy:Missing",
+                "destination_library": destination.to_string_lossy()
+            }),
+        )
+        .await;
+        assert!(error.contains("not found"), "{error}");
+        assert!(!destination.exists());
+    }
+
+    #[tokio::test]
+    async fn extract_footprint_from_board_removes_instance_state_and_keeps_geometry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let board = tmp.path().join("source.kicad_pcb");
+        let destination = tmp.path().join("clean.pretty");
+        let source = r#"(kicad_pcb
+  (version 20240108)
+  (footprint "Legacy:Part"
+    (layer "F.Cu")
+    (at 100 50 90)
+    (property "Reference" "R4" (at -1 0 0))
+    (property "Value" "4k7" (at 0 1 90))
+    (path "/1234")
+    (fp_line (start -2 -1) (end 2 -1) (stroke (width 0.1) (type default)) (layer "F.SilkS"))
+    (pad "1" smd rect (at -1 0 0) (size 1 1) (layers "F.Cu" "F.Paste" "F.Mask") (net 1 "A") (pinfunction "IN") (pintype "input"))
+    (pad "2" smd rect (at 1 0 0) (size 1 1) (layers "F.Cu" "F.Paste" "F.Mask") (net 2 "B"))
+    (model "old/part.step" (offset (xyz 1 2 3)) (scale (xyz 1 1 1)) (rotate (xyz 0 0 90)))
+  )
+)
+"#;
+        std::fs::write(&board, source).unwrap();
+        let result = call_library_tool(
+            "extract_footprint_from_board",
+            json!({
+                "board": board.to_string_lossy(),
+                "reference": "R4",
+                "destination_library": destination.to_string_lossy(),
+                "new_name": "ResistorClean"
+            }),
+        )
+        .await;
+        assert!(!result.is_error, "extract failed: {:?}", result.content);
+        let text = std::fs::read_to_string(destination.join("ResistorClean.kicad_mod")).unwrap();
+        assert!(text.contains("(footprint \"ResistorClean\""));
+        assert!(!text.contains("(at 100 50 90)"));
+        assert!(!text.contains("(path \"/1234\")"));
+        assert!(!text.contains("(net "));
+        assert!(!text.contains("(pinfunction "));
+        assert!(text.contains("(property \"Reference\" \"REF**\""));
+        assert!(text.contains("(property \"Value\" \"ResistorClean\""));
+        assert!(text.contains("(pad \"1\" smd rect (at -1 0 0)"));
+        assert!(text.contains("(fp_line "));
+        assert!(text.contains("(offset (xyz 1 2 3))"));
+        assert!(text.contains("(rotate (xyz 0 0 90))"));
+        let result_text = match &result.content[0] {
+            crate::mcp::protocol::ToolContent::Text { text } => text,
+            _ => panic!("expected text result"),
+        };
+        assert!(result_text.contains("footprint_local"));
+        assert_eq!(std::fs::read_to_string(&board).unwrap(), source);
+    }
+
+    #[tokio::test]
+    async fn extract_footprint_from_board_refuses_ambiguous_board_only_references() {
+        let tmp = tempfile::tempdir().unwrap();
+        let board = tmp.path().join("source.kicad_pcb");
+        let destination = tmp.path().join("must-not-be-created.pretty");
+        let source = r#"(kicad_pcb
+  (version 20240108)
+  (footprint "Legacy:One" (layer "F.Cu") (at 10 20 90)
+    (property "Reference" "REF**") (property "Value" "One")
+    (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu" "F.Paste" "F.Mask")))
+  (footprint "Legacy:Two" (layer "F.Cu") (at 30 40 0)
+    (property "Reference" "REF**") (property "Value" "Two")
+    (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu" "F.Paste" "F.Mask")))
+)
+"#;
+        std::fs::write(&board, source).unwrap();
+        let error = call_library_tool_error(
+            "extract_footprint_from_board",
+            json!({
+                "board": board.to_string_lossy(),
+                "reference": "REF**",
+                "destination_library": destination.to_string_lossy()
+            }),
+        )
+        .await;
+        assert!(error.contains("duplicate footprint Reference"), "{error}");
+        assert_eq!(std::fs::read_to_string(&board).unwrap(), source);
+        assert!(!destination.exists());
+    }
+
+    #[tokio::test]
+    async fn extract_footprint_from_back_side_refuses_without_writing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let board = tmp.path().join("source.kicad_pcb");
+        let destination = tmp.path().join("must-not-be-created.pretty");
+        let source = r#"(kicad_pcb (version 20240108)
+  (footprint "Legacy:Part" (layer "B.Cu") (at 10 20 90)
+    (property "Reference" "R1") (property "Value" "Part")
+    (pad "1" smd rect (at -1 0) (size 1 1) (layers "B.Cu" "B.Paste" "B.Mask"))))
+"#;
+        std::fs::write(&board, source).unwrap();
+        let error = call_library_tool_error(
+            "extract_footprint_from_board",
+            json!({
+                "board": board.to_string_lossy(),
+                "reference": "R1",
+                "destination_library": destination.to_string_lossy()
+            }),
+        )
+        .await;
+        assert!(error.contains("back-side footprint"), "{error}");
+        assert_eq!(std::fs::read_to_string(&board).unwrap(), source);
+        assert!(!destination.exists());
+    }
+
+    #[tokio::test]
+    async fn extract_footprint_from_board_refuses_missing_reference_without_writing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let board = tmp.path().join("source.kicad_pcb");
+        let destination = tmp.path().join("clean.pretty");
+        std::fs::write(&board, "(kicad_pcb (version 20240108))").unwrap();
+        let error = call_library_tool_error(
+            "extract_footprint_from_board",
+            json!({
+                "board": board.to_string_lossy(),
+                "reference": "U1",
+                "destination_library": destination.to_string_lossy()
+            }),
+        )
+        .await;
+        assert!(error.contains("not found"), "{error}");
+        assert!(!destination.exists());
     }
 
     /// Build a temp "project dir" containing a `sym-lib-table` that references a
